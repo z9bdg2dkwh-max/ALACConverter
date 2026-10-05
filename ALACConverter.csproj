@@ -12,6 +12,12 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <ImplicitUsings>disable</ImplicitUsings>
+    <Version>1.0.0</Version>
+    <FileVersion>1.0.0.0</FileVersion>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <Product>ALAC 音乐转换器</Product>
+    <Description>将 FLAC / WAV / AIFF 等音频转换为 Apple Music 兼容的 ALAC 无损格式（.m4a）</Description>
+    <Copyright>Copyright (c) 2026 z9bdg2dkwh-max</Copyright>
   </PropertyGroup>
 
   <!-- ============ WinUI 3 / Windows App SDK ============ -->
