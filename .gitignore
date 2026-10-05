@@ -1,0 +1,38 @@
+# ===== 构建产物（206 MB，绝不能提交）=====
+bin/
+obj/
+发布/
+dist/
+publish/
+*.publishsettings
+
+# ===== 用户本地文件 =====
+*.user
+*.suo
+*.userprefs
+.vs/
+.vscode/
+*.log
+*.m4a
+*.converting
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ===== 备份产物 =====
+备份/
+*.zip
+
+# ===== 资源文件 =====
+*.dll.mui
+*.pri
+*.pdb
+
+# ===== 说明 =====
+# 注意：本项目必须提交 ffmpeg.exe.deflate（37.9 MB，GPLv2 编译产物），
+# 否则他人克隆后无法编译运行——它以 EmbeddedResource 形式嵌入程序。
+# 该文件虽为二进制，但远低于 GitHub 单文件 100 MB 限制。
+#
+# 不要在此处添加 *.dll 或 *.exe 规则：
+# NuGet 依赖不在仓库中，但 *.deps.json / *.runtimeconfig.json 是源码级配置，
+# 需随项目保留以便排查。

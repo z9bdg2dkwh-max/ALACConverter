@@ -1,0 +1,61 @@
+第三方组件与许可声明
+================================================================
+
+本程序内嵌了 FFmpeg 可执行文件（以 deflate 压缩形式内嵌，运行时释放到
+%TEMP%\ALACConverter\ffmpeg.exe）。
+
+----------------------------------------------------------------
+1. FFmpeg
+----------------------------------------------------------------
+版本：N-108894-g01b9abd771-20221030（2022-10-30 构建）
+来源：https://ffmpeg.org/download.html
+许可：GNU General Public License v2 或更高版本
+
+本程序使用的 FFmpeg 构建启用了 GPL 特性（--enable-gpl），
+因此本程序整体在分发时须遵循 GPL v2 的相关条款。
+
+FFmpeg 的法律声明原文要点：
+  本程序中的 FFmpeg 依据 LGPL v2.1 或 GPL v2 进行授权。
+  如果 FFmpeg 的某个构建被标记为不可用于任何目的，
+  则不应使用该构建。
+
+  FFmpeg 本身不含专利授权。本程序不应被表述为能够提供
+  专利许可；如需专利授权，请自行向相关权利人取得。
+
+  FFmpeg 的部分源码可能来自非 GPL 的项目，其授权条款各异，
+  使用前请参阅完整的 COPYING.LGPLv2.1 与 COPYING.GPLv2 文件。
+
+本程序以「原样」提供 FFmpeg，不附带任何担保。
+
+----------------------------------------------------------------
+2. Windows 运行时与 Windows App SDK
+----------------------------------------------------------------
+本程序使用 Microsoft .NET 9 与 Windows App SDK 1.7（WinUI 3）。
+二者均为 Microsoft Corporation 出品，遵循 MIT 许可。
+
+----------------------------------------------------------------
+3. Segoe MDL2 Assets / Segoe Fluent Icons 字体
+----------------------------------------------------------------
+本程序界面图标使用 Microsoft 提供的图标字体，
+依据 Microsoft Software License Terms 使用。
+
+----------------------------------------------------------------
+分发提示
+----------------------------------------------------------------
+若你要把本程序分发给他人使用，请一并提供上述许可声明文件，
+并确保 FFmpeg 的源码或获取源码的途径（如对应版本的官方下载页）
+对接收者可得。
+
+----------------------------------------------------------------
+部署形态说明
+----------------------------------------------------------------
+本程序采用「免打包自包含」发布（WindowsPackageType=None），
+因此整个「发布」目录需整体复制，不可只取 exe。
+
+注意：WinUI 3 官方不支持单文件 exe 打包
+（微软文档原文：「dotnet publish bundles managed assemblies but
+cannot produce a single-file EXE for WinUI 3 apps — the native
+Windows App SDK runtime dependencies must remain as separate files」）。
+
+用户配置存放位置：%LOCALAPPDATA%\ALACConverter\theme.cfg
+转码引擎释放位置：%TEMP%\ALACConverter\ffmpeg.exe

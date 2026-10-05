@@ -1,0 +1,59 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>ALACConverter</RootNamespace>
+    <AssemblyName>ALACConverter</AssemblyName>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <UseWinUI>true</UseWinUI>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+  </PropertyGroup>
+
+  <!-- ============ WinUI 3 / Windows App SDK ============ -->
+  <PropertyGroup>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <WindowsSdkPackageVersion>10.0.19041.87</WindowsSdkPackageVersion>
+    <SelfContained>true</SelfContained>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 应用图标：exe、任务栏固定项、资源管理器均取此文件 -->
+    <ApplicationIcon>Resources\ALACConverter.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.7.250606001" />
+  </ItemGroup>
+
+  <!-- 运行时按需读取图标副本。
+       同一文件不能既 <Resource> 又 <Content>/<None Update>（后者静默失效），
+       故用 Link 复制为独立文件。 -->
+  <ItemGroup>
+    <None Include="Resources\ALACConverter.ico"
+          Link="ALACConverter.ico"
+          CopyToOutputDirectory="PreserveNewest"
+          Visible="false" />
+  </ItemGroup>
+
+  <!-- ============ 发布 ============ -->
+  <PropertyGroup>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <DebugType>none</DebugType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CA1416;NU1701;MSB3277;CS9057</NoWarn>
+  </PropertyGroup>
+
+  <!-- ============ 内嵌 ffmpeg 引擎（唯一外部依赖，内嵌后用户无需任何附带文件） ============ -->
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\ffmpeg.exe.deflate">
+      <LogicalName>ALACConverter.ffmpeg.deflate</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>
