@@ -43,7 +43,72 @@ namespace ALACConverter.Services
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "ALACConverter", "theme.cfg");
 
-        public static void Register(Window w) => Windows.Add(w);
+        /// <summary>零散偏好（窗口尺寸/位置等）另存一个文件，不动主题那份单行配置。</summary>
+        private static string PrefsPath => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ALACConverter", "prefs.cfg");
+
+        /// <summary>读一个偏好键；不存在或读失败返回空串。</summary>
+        public static string Get(string key)
+        {
+            try
+            {
+                if (!File.Exists(PrefsPath)) return string.Empty;
+                foreach (var line in File.ReadAllLines(PrefsPath))
+                {
+                    int eq = line.IndexOf('=');
+                    if (eq > 0 && line.Substring(0, eq) == key)
+                        return line.Substring(eq + 1);
+                }
+            }
+            catch
+            {
+                // 读不出来按「没有存过」处理
+            }
+            return string.Empty;
+        }
+
+        /// <summary>写一个偏好键。文件只有几行，整读整写即可。</summary>
+        public static void Put(string key, string value)
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(PrefsPath);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+                var map = new Dictionary<string, string>();
+                if (File.Exists(PrefsPath))
+                {
+                    foreach (var line in File.ReadAllLines(PrefsPath))
+                    {
+                        int eq = line.IndexOf('=');
+                        if (eq > 0) map[line.Substring(0, eq)] = line.Substring(eq + 1);
+                    }
+                }
+                map[key] = value;
+
+                var sb = new System.Text.StringBuilder();
+                foreach (var kv in map)
+                    sb.Append(kv.Key).Append('=').Append(kv.Value).Append('\n');
+                File.WriteAllText(PrefsPath, sb.ToString());
+            }
+            catch
+            {
+                // 存不下来不影响使用
+            }
+        }
+
+        public static void Register(Window w)
+        {
+            if (!Windows.Contains(w)) Windows.Add(w);
+        }
+
+        /// <summary>
+        /// 窗口关闭时注销。
+        /// 静态列表若继续持有已关闭的 Window，整棵 XAML 可视化树都无法被回收，
+        /// 反复开关窗口时内存只涨不落。必须在 Closed 里显式移除。
+        /// </summary>
+        public static void Unregister(Window w) => Windows.Remove(w);
 
         public static AppTheme Current
         {
@@ -97,8 +162,10 @@ namespace ALACConverter.Services
                 _ => ElementTheme.Default
             };
 
-            foreach (var w in Windows)
+            // 倒序遍历：顺手把已关闭（Content 已释放）的窗口清出列表
+            for (int i = Windows.Count - 1; i >= 0; i--)
             {
+                var w = Windows[i];
                 if (w.Content is FrameworkElement fe)
                 {
                     fe.RequestedTheme = element;
@@ -106,6 +173,10 @@ namespace ALACConverter.Services
                     // 底色只能设在 Panel（Grid/StackPanel 等）根元素上
                     if (fe is Microsoft.UI.Xaml.Controls.Panel panel)
                         panel.Background = new SolidColorBrush(CurrentBackground);
+                }
+                else
+                {
+                    Windows.RemoveAt(i);
                 }
             }
 

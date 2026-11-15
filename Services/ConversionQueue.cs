@@ -22,6 +22,13 @@ namespace ALACConverter.Services
 
         /// <summary>输出完成后自动打开所在文件夹</summary>
         public bool OpenFolderWhenDone { get; set; }
+
+        /// <summary>
+        /// 同时转换的文件数。ALAC 编码本身是单线程的，
+        /// 单文件串行执行时多核 CPU 大部分处于空闲状态，靠多文件并行才能吃满。
+        /// 1 = 旧行为（严格串行）。
+        /// </summary>
+        public int MaxParallelism { get; set; } = 1;
     }
 
     public sealed class BatchSummary
@@ -44,6 +51,16 @@ namespace ALACConverter.Services
         private readonly ConvertSettings _settings;
         private readonly Action<string> _log;
         private CancellationTokenSource? _cts;
+
+        /// <summary>
+        /// 按输出路径的闸门。并行时两个同名源文件会算出同一个 outputPath，
+        /// 若同时落盘会互相覆盖（串行时只是"后者覆盖前者"，并行会变成写坏文件）。
+        /// 这里让同一目标路径的收尾段串行执行。
+        /// </summary>
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> _pathGates = new();
+
+        private SemaphoreSlim GetPathGate(string outputPath)
+            => _pathGates.GetOrAdd(outputPath, _ => new SemaphoreSlim(1, 1));
 
         public ConversionQueue(TranscodeEngine engine, ConvertSettings settings, Action<string> log)
         {
@@ -73,7 +90,13 @@ namespace ALACConverter.Services
             IsRunning = true;
             try
             {
-                foreach (var job in jobs)
+                int parallelism = _settings.MaxParallelism < 1 ? 1 : _settings.MaxParallelism;
+                var options = new ParallelOptions { MaxDegreeOfParallelism = parallelism };
+
+                // 不把 ct 放进 ParallelOptions：那样取消时整个 ForEachAsync 会抛
+                // OperationCanceledException，已排队的任务算不进统计，汇总数字会缺一截。
+                // 改为在循环体里自行判断，未开始的任务照样计入 cancelled。
+                await Parallel.ForEachAsync(jobs, options, async (job, _) =>
                 {
                     if (ct.IsCancellationRequested)
                     {
@@ -82,29 +105,44 @@ namespace ALACConverter.Services
                             job.Status = JobStatus.Cancelled;
                             job.Message = "队列已取消";
                         }
-                        cancelled++;
-                        continue;
+                        Interlocked.Increment(ref cancelled);
+                        completedCount.Report(Interlocked.Increment(ref index));
+                        return;
                     }
 
-                    index++;
-                    await ProcessOneAsync(job, ct).ConfigureAwait(false);
+                    try
+                    {
+                        await ProcessOneAsync(job, ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        job.Status = JobStatus.Cancelled;
+                        job.Message = "已取消";
+                    }
+                    catch (Exception ex)
+                    {
+                        // 并行之后，单个任务的意外异常不能把整批拖下水
+                        job.Status = JobStatus.Failed;
+                        job.Message = "未预期的错误：" + ex.Message;
+                    }
 
                     switch (job.Status)
                     {
-                        case JobStatus.Done: ok++; break;
-                        case JobStatus.Failed: fail++; break;
-                        case JobStatus.Skipped: skip++; break;
-                        case JobStatus.Cancelled: cancelled++; break;
+                        case JobStatus.Done: Interlocked.Increment(ref ok); break;
+                        case JobStatus.Failed: Interlocked.Increment(ref fail); break;
+                        case JobStatus.Skipped: Interlocked.Increment(ref skip); break;
+                        case JobStatus.Cancelled: Interlocked.Increment(ref cancelled); break;
                     }
 
-                    if (job.OutputBytes > 0) bytes += job.OutputBytes;
-                    completedCount.Report(index);
-                }
+                    if (job.OutputBytes > 0) Interlocked.Add(ref bytes, job.OutputBytes);
+                    completedCount.Report(Interlocked.Increment(ref index));
+                }).ConfigureAwait(false);
             }
             finally
             {
                 sw.Stop();
                 IsRunning = false;
+                _pathGates.Clear();   // 批次结束，闸门不再需要
                 cts.Dispose();
                 _cts = null;
             }
@@ -197,8 +235,9 @@ namespace ALACConverter.Services
 
             job.Message = warn.Count > 0 ? string.Join("；", warn) : "准备转换…";
 
-            // 先写临时文件，成功后再改名，杜绝半成品被误认为成品
-            var tempPath = outputPath + ".converting";
+            // 先写临时文件，成功后再改名，杜绝半成品被误认为成品。
+            // 临时名带随机后缀：并行时同名源文件不会共用一个 .converting 互相踩踏。
+            var tempPath = outputPath + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".converting";
             SafeDelete(tempPath);
 
             var args = _engine.BuildArguments(job.SourcePath, tempPath, info, targetRate, targetChannels);
@@ -207,7 +246,12 @@ namespace ALACConverter.Services
             // 而此处已在后台线程。AudioJob.Notify 内部已用 DispatcherQueue 切回 UI 线程，
             // 因此这里的回调只做赋值即可。
             var progress = new InlineProgress(p => job.Progress = p);
-            var res = await _engine.RunAsync(args, info, progress, _log, ct).ConfigureAwait(false);
+
+            // 日志带文件名前缀：并行时多条 ffmpeg 输出会交错，
+            // 没有前缀就分不清哪一行属于哪个文件。
+            var tag = Path.GetFileName(job.SourcePath);
+            var res = await _engine.RunAsync(args, info, progress,
+                msg => _log($"[{tag}] {msg}"), ct).ConfigureAwait(false);
 
             if (!res.Success)
             {
@@ -232,8 +276,21 @@ namespace ALACConverter.Services
                 }
             }
 
+            // 落盘段按目标路径加闸，并在写入前重新确认占位：
+            // 并行时可能已有另一个任务抢先产出了同名文件，此时应跳过而不是覆盖。
+            var gate = GetPathGate(outputPath);
+            await gate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
+                if (File.Exists(outputPath) && !_settings.OverwriteExisting)
+                {
+                    SafeDelete(tempPath);
+                    job.Status = JobStatus.Skipped;
+                    job.Message = "目标文件已存在（未勾选覆盖）";
+                    job.OutputPath = outputPath;
+                    return;
+                }
+
                 if (File.Exists(outputPath)) File.Delete(outputPath);
                 File.Move(tempPath, outputPath);
             }
@@ -243,6 +300,10 @@ namespace ALACConverter.Services
                 job.Status = JobStatus.Failed;
                 job.Message = "写入目标文件失败：" + ex.Message;
                 return;
+            }
+            finally
+            {
+                gate.Release();
             }
 
             job.OutputPath = outputPath;

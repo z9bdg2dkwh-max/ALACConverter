@@ -279,6 +279,19 @@
                             </StackPanel>
                         </Border>
 
+                        <!-- 并行数：ALAC 编码本身是单线程的，单文件串行跑不满多核 -->
+                        <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                            <TextBlock Text="同时转换" FontSize="11.5" VerticalAlignment="Center"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <ComboBox x:Name="ParallelBox" MinWidth="112" SelectedIndex="2">
+                                <ComboBoxItem Content="1 个（省电）" Tag="1" />
+                                <ComboBoxItem Content="2 个" Tag="2" />
+                                <ComboBoxItem Content="4 个（推荐）" Tag="4" />
+                                <ComboBoxItem Content="6 个" Tag="6" />
+                                <ComboBoxItem Content="8 个" Tag="8" />
+                            </ComboBox>
+                        </StackPanel>
+
                         <Button x:Name="StartButton" Content="开始转换"
                                 Click="OnStart"
                                 Style="{StaticResource AccentButtonStyle}"

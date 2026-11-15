@@ -3,6 +3,8 @@ using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.Windows.AppNotifications;
+using Microsoft.Windows.AppNotifications.Builder;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -33,6 +35,19 @@ namespace ALACConverter
         private CancellationTokenSource? _batchCts;
         private bool _engineReady;
 
+        /// <summary>通知是否注册成功。失败时静默跳过，绝不影响转换主流程。</summary>
+        private bool _notificationsReady;
+
+        /// <summary>任务栏进度（ITaskbarList3）。取不到就整段跳过，不影响转换。</summary>
+        private ITaskbarList3? _taskbar;
+        private IntPtr _hwnd;
+
+        /// <summary>命令行带了 --auto：引擎就绪后自动开转，不用再点按钮。</summary>
+        private bool _autoStartFromCommandLine;
+
+        /// <summary>任务栏进度出错只记一次日志，避免高频刷新刷爆日志。</summary>
+        private bool _taskbarErrorLogged;
+
         private static readonly string[] SupportedExtensions =
         {
             ".mp3", ".flac", ".wav", ".aiff", ".aif", ".ape", ".wma", ".m4a", ".aac",
@@ -59,7 +74,7 @@ namespace ALACConverter
             ApplyWindowIcon();
             ApplyTitleBarMetrics();
             AppWindow.Changed += OnWindowChanged;
-            FitWindowToWorkArea();
+            RestoreWindowBounds();   // 有历史尺寸/位置就恢复，没有才按屏幕自适应
 
             // 记录工作区尺寸，窗口被用户改动大小时按屏幕限制回弹
             _workArea = GetWorkAreaSize();
@@ -68,11 +83,15 @@ namespace ALACConverter
             ThemeService.ThemeChanged += OnThemeChanged;
 
             JobsView.ItemsSource = _jobs.Items;
+            RestoreParallelism();
             UpdateEmptyState();
             UpdateThemeGlyph();
 
             if (RootGrid != null)
                 RootGrid.Loaded += OnLoaded;
+
+            // 关闭时必须解开静态引用，否则窗口连同整棵 XAML 树不会被回收
+            Closed += OnClosed;
         }
 
         private void OnThemeChanged(object? sender, AppTheme theme)
@@ -80,6 +99,27 @@ namespace ALACConverter
             // 纯色背板：随主题刷新内容根元素底色（Window 本身无 Background）
             if (RootGrid != null)
                 RootGrid.Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(ThemeService.CurrentBackground);
+        }
+
+        /// <summary>
+        /// 窗口关闭：解开所有静态挂载点并停掉后台转码。
+        ///
+        /// ThemeService.Windows 与 ThemeService.ThemeChanged 都是静态成员，
+        /// 静态字段持有 Window 等价于把整棵可视化树钉死在内存里，
+        /// 只靠运行时 GC 是收不掉的（Windows App SDK 2.6.4 改善的是
+        /// 框架侧对不可达 WinUI 对象的清理，应用自己攥的强引用仍需手动放开）。
+        /// 同时取消 _batchCts，避免关窗后 ffmpeg 子进程继续写文件。
+        /// </summary>
+        private void OnClosed(object sender, WindowEventArgs args)
+        {
+            // 先存几何，再解绑——解绑后窗口句柄可能已经失效
+            try { SaveWindowBounds(); } catch { }
+            try { AppWindow.Changed -= OnWindowChanged; } catch { }
+            try { ThemeService.ThemeChanged -= OnThemeChanged; } catch { }
+            try { ThemeService.Unregister(this); } catch { }
+            try { _batchCts?.Cancel(); } catch { }
+            try { _batchCts?.Dispose(); } catch { }
+            _batchCts = null;
         }
 
         private void UpdateThemeGlyph()
@@ -98,6 +138,35 @@ namespace ALACConverter
                 _ => "当前：跟随系统（点击切换为浅色）"
             };
             ToolTipService.SetToolTip(ThemeButton, tip);
+        }
+
+        /// <summary>恢复上次选的并行数；没有记录就保持 XAML 里的默认值（4 个）。</summary>
+        private void RestoreParallelism()
+        {
+            try
+            {
+                var saved = ThemeService.Get("parallel");
+                if (!int.TryParse(saved, out int pv) || pv < 1) return;
+
+                foreach (var obj in ParallelBox.Items)
+                {
+                    if (obj is ComboBoxItem item && item.Tag?.ToString() == pv.ToString())
+                    {
+                        ParallelBox.SelectedItem = item;
+                        return;
+                    }
+                }
+            }
+            catch { /* 取不到就用默认值 */ }
+        }
+
+        /// <summary>读当前并行数；控件异常时退回 1，等同于旧的串行行为。</summary>
+        private int ReadParallelism()
+        {
+            if (ParallelBox?.SelectedItem is ComboBoxItem item &&
+                int.TryParse(item.Tag?.ToString(), out int n) && n >= 1)
+                return n;
+            return 1;
         }
 
         /// <summary>队列为空时显示拖放引导，有内容时隐藏。</summary>
@@ -137,6 +206,68 @@ namespace ALACConverter
         }
 
         private (int Width, int Height) _workArea;
+
+        /// <summary>
+        /// 恢复上次关闭时的窗口尺寸与位置；没有记录或记录明显不合理时退回屏幕自适应。
+        ///
+        /// 位置做了一次粗略范围检查：显示器拔掉后旧坐标可能落在不存在的区域，
+        /// 直接 Move 过去窗口就再也看不见了。
+        /// </summary>
+        private void RestoreWindowBounds()
+        {
+            try
+            {
+                var ws = ThemeService.Get("winW");
+                var hs = ThemeService.Get("winH");
+                if (ws.Length == 0 || hs.Length == 0) { FitWindowToWorkArea(); return; }
+
+                if (!int.TryParse(ws, out int w) || !int.TryParse(hs, out int h))
+                {
+                    FitWindowToWorkArea();
+                    return;
+                }
+
+                // 小于设计下限视为脏数据；1000 是文字不被裁切的最小可用宽度
+                if (w < 1000 || h < 640) { FitWindowToWorkArea(); return; }
+
+                AppWindow.Resize(new Windows.Graphics.SizeInt32(w, h));
+
+                if (int.TryParse(ThemeService.Get("winX"), out int x) &&
+                    int.TryParse(ThemeService.Get("winY"), out int y) &&
+                    x > -20000 && x < 20000 && y > -20000 && y < 20000)
+                {
+                    AppWindow.Move(new Windows.Graphics.PointInt32(x, y));
+                }
+            }
+            catch (Exception ex)
+            {
+                App.Trace("恢复窗口尺寸失败：" + ex.Message);
+                FitWindowToWorkArea();
+            }
+        }
+
+        /// <summary>
+        /// 记录当前窗口几何。最大化/最小化时不覆盖已存的还原尺寸，
+        /// 否则下次启动会得到一个铺满屏幕的窗口，用户还得手动调回来。
+        /// </summary>
+        private void SaveWindowBounds()
+        {
+            try
+            {
+                if (AppWindow.Presenter is not OverlappedPresenter p ||
+                    p.State != OverlappedPresenterState.Restored)
+                    return;
+
+                ThemeService.Put("winW", AppWindow.Size.Width.ToString());
+                ThemeService.Put("winH", AppWindow.Size.Height.ToString());
+                ThemeService.Put("winX", AppWindow.Position.X.ToString());
+                ThemeService.Put("winY", AppWindow.Position.Y.ToString());
+            }
+            catch
+            {
+                // 存不下来不影响关闭
+            }
+        }
 
         /// <summary>
         /// 按当前屏幕工作区设置窗口尺寸，保证启动即完整显示、不被屏幕边缘裁切。
@@ -252,7 +383,209 @@ namespace ALACConverter
 
         private void OnLoaded(object sender, RoutedEventArgs e)
         {
+            InitNotifications();
+            InitTaskbar();
             _ = PrepareEngineAsync();
+            _ = CaptureSelfIfRequestedAsync();
+            _ = NotifySelfTestAsync();
+            EnqueueCommandLineFiles();
+        }
+
+        /// <summary>
+        /// 注册系统通知。批量转换几十个文件时用户不会一直盯着窗口，
+        /// 转完弹一条系统通知比界面上的一行字有用得多。
+        ///
+        /// 免打包（WindowsPackageType=None）应用走 SDK 的自动 AUMID，
+        /// 注册可能因系统策略失败——失败就安静降级，不影响任何转换功能。
+        /// </summary>
+        private void InitNotifications()
+        {
+            try
+            {
+                var mgr = AppNotificationManager.Default;
+                // 订阅激活事件：不订阅的话点击通知可能让进程处于未处理状态
+                mgr.NotificationInvoked += (_, _) => { };
+                mgr.Register();
+                _notificationsReady = true;
+                App.Trace("通知已注册");
+            }
+            catch (Exception ex)
+            {
+                _notificationsReady = false;
+                App.Trace("通知注册失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>转换结束发一条通知，内容与界面横幅保持一致。</summary>
+        private void NotifyDone(BatchSummary s)
+        {
+            if (!_notificationsReady) return;
+
+            try
+            {
+                bool clean = s.Failed == 0 && s.Cancelled == 0;
+                var notification = new AppNotificationBuilder()
+                    .AddText(clean ? "转换完成" : "转换结束")
+                    .AddText(clean
+                        ? $"成功 {s.Succeeded} 个，耗时 {s.ElapsedSeconds:0.0} 秒"
+                        : $"成功 {s.Succeeded}，失败 {s.Failed}，跳过 {s.Skipped}，取消 {s.Cancelled}")
+                    .BuildNotification();
+
+                AppNotificationManager.Default.Show(notification);
+                App.Trace($"转换完成通知已发送：成功 {s.Succeeded}，失败 {s.Failed}");
+            }
+            catch (Exception ex)
+            {
+                App.Trace("发送通知失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 初始化任务栏进度条。WinUI 3 的 AppWindow 没有进度 API，
+        /// 只能走 shell 的 ITaskbarList3；最小化后进度仍可见，这是它的价值所在。
+        /// </summary>
+        private void InitTaskbar()
+        {
+            try
+            {
+                var clsid = new Guid("56FDF344-FD6D-11d0-958A-006097C9A090");
+                var type = Type.GetTypeFromCLSID(clsid);
+                if (type == null) return;
+
+                _taskbar = Activator.CreateInstance(type) as ITaskbarList3;
+                _taskbar?.HrInit();
+                _hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+            }
+            catch (Exception ex)
+            {
+                _taskbar = null;
+                App.Trace("任务栏进度初始化失败：" + ex.Message);
+            }
+        }
+
+        private void SetTaskbarProgress(int done, int total)
+        {
+            if (_taskbar == null || _hwnd == IntPtr.Zero) return;
+            try
+            {
+                if (total <= 0)
+                {
+                    _taskbar.SetProgressState(_hwnd, TaskbarProgressState.NoProgress);
+                    return;
+                }
+                _taskbar.SetProgressState(_hwnd, TaskbarProgressState.Normal);
+                _taskbar.SetProgressValue(_hwnd, (ulong)done, (ulong)total);
+            }
+            catch (Exception ex)
+            {
+                // 只记第一次：进度条每秒刷新一次，重复记录会把日志刷爆
+                if (!_taskbarErrorLogged)
+                {
+                    _taskbarErrorLogged = true;
+                    App.Trace("任务栏进度调用失败：" + ex.Message);
+                }
+            }
+        }
+
+        private void ClearTaskbarProgress()
+        {
+            if (_taskbar == null || _hwnd == IntPtr.Zero) return;
+            try { _taskbar.SetProgressState(_hwnd, TaskbarProgressState.NoProgress); } catch { }
+        }
+
+        /// <summary>
+        /// 通知自检：设置 ALAC_NOTIFY_TEST=1 启动后真发一条通知，把 Show 的结果写进日志。
+        ///
+        /// 「Register 成功」只说明注册没报错，不代表通知真能弹出来——
+        /// 通知被系统静音、被专注助手拦截、AUMID 没落到开始菜单，
+        /// 都表现为「注册成功但什么都看不见」。这个钩子就是用来区分这两种情况的。
+        /// </summary>
+        private async Task NotifySelfTestAsync()
+        {
+            var flag = Environment.GetEnvironmentVariable("ALAC_NOTIFY_TEST");
+            if (string.IsNullOrEmpty(flag)) return;
+
+            await Task.Delay(2000);
+
+            if (!_notificationsReady)
+            {
+                App.Trace("通知自检：跳过（未注册成功）");
+            }
+            else
+            {
+                try
+                {
+                    var n = new AppNotificationBuilder()
+                        .AddText("ALAC 通知自检")
+                        .AddText("看到这条，说明转换完成通知可用")
+                        .BuildNotification();
+                    AppNotificationManager.Default.Show(n);
+                    App.Trace("通知自检：Show 已调用，无异常");
+                }
+                catch (Exception ex)
+                {
+                    App.Trace("通知自检：Show 抛异常 —— " + ex.Message);
+                }
+            }
+
+            await Task.Delay(1500);
+            try { Application.Current.Exit(); } catch { }
+        }
+
+        /// <summary>
+        /// 诊断用：把界面自身渲染成 PNG。
+        ///
+        /// 与 AvifHeifConverter 保持同一套手法——在看不到窗口的环境里
+        /// （脚本启动、远程、CI）核对真实配色与布局，而不是靠文字描述去猜。
+        /// 设置环境变量 ALAC_SHOT=&lt;输出路径&gt; 即触发，渲染完自动退出。
+        /// </summary>
+        private async Task CaptureSelfIfRequestedAsync()
+        {
+            var shot = Environment.GetEnvironmentVariable("ALAC_SHOT");
+            if (string.IsNullOrWhiteSpace(shot)) return;
+
+            // 等首帧排版与引擎状态稳定，否则截到的是空列表、未定位的标题栏
+            await Task.Delay(1500);
+
+            try
+            {
+                var rtb = new Microsoft.UI.Xaml.Media.Imaging.RenderTargetBitmap();
+                await rtb.RenderAsync(RootGrid);
+                var buf = await rtb.GetPixelsAsync();
+
+                int w = rtb.PixelWidth, h = rtb.PixelHeight;
+                var reader = Windows.Storage.Streams.DataReader.FromBuffer(buf);
+                var bgra = new byte[buf.Length];
+                reader.ReadBytes(bgra);
+
+                var dir = Path.GetDirectoryName(Path.GetFullPath(shot));
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+                using (var stream = new Windows.Storage.Streams.InMemoryRandomAccessStream())
+                {
+                    var encoder = await Windows.Graphics.Imaging.BitmapEncoder.CreateAsync(
+                        Windows.Graphics.Imaging.BitmapEncoder.PngEncoderId, stream);
+                    encoder.SetPixelData(
+                        Windows.Graphics.Imaging.BitmapPixelFormat.Bgra8,
+                        Windows.Graphics.Imaging.BitmapAlphaMode.Premultiplied,
+                        (uint)w, (uint)h, 96, 96, bgra);
+                    await encoder.FlushAsync();
+
+                    stream.Seek(0);
+                    using var outFs = File.Create(shot);
+                    await stream.AsStreamForRead().CopyToAsync(outFs);
+                }
+
+                AppendLog($"[诊断] 界面已渲染到 {shot}（{w}×{h}）");
+            }
+            catch (Exception ex)
+            {
+                AppendLog("[诊断] 渲染失败：" + ex.Message);
+            }
+            finally
+            {
+                try { Application.Current.Exit(); } catch { }
+            }
         }
 
         private async Task PrepareEngineAsync()
@@ -266,6 +599,12 @@ namespace ALACConverter
                 EngineBadge.Text = "内置引擎就绪";
                 EngineBadge.Foreground = new SolidColorBrush(Colors.MediumSeaGreen);
                 AppendLog("引擎路径：" + path);
+
+                if (_autoStartFromCommandLine && _jobs.Count > 0)
+                {
+                    AppendLog("[命令行] 引擎就绪，自动开始转换");
+                    OnStart(this, new RoutedEventArgs());
+                }
             }
             catch (Exception ex)
             {
@@ -319,9 +658,44 @@ namespace ALACConverter
             foreach (var d in sub) CollectAudio(d, acc, depth + 1);
         }
 
-        private void AddPaths(IEnumerable<string> paths)
+        /// <summary>
+        /// 把命令行传入的文件/目录加入队列。
+        ///
+        /// 用途：把文件（或文件夹）直接拖到 exe 图标上就能转，
+        /// 也可以给常用目录建快捷方式。参数里的目录会递归展开成音频文件。
+        /// 没有参数时整段直接返回，正常双击启动不受影响。
+        /// </summary>
+        private void EnqueueCommandLineFiles()
         {
-            var existing = new HashSet<string>(_jobs.Items.Select(j => j.SourcePath), StringComparer.OrdinalIgnoreCase);
+            string[] args;
+            try { args = Environment.GetCommandLineArgs(); }
+            catch { return; }
+            if (args.Length <= 1) return;
+
+            // --auto：入队完自动开转，配合「拖到 exe 图标」＝一键转换
+            _autoStartFromCommandLine = args.Any(a =>
+                a.Equals("--auto", StringComparison.OrdinalIgnoreCase));
+
+            var paths = new List<string>();
+            foreach (var a in args.Skip(1))
+            {
+                if (string.IsNullOrWhiteSpace(a) || a.StartsWith("--", StringComparison.Ordinal)) continue;
+                try
+                {
+                    if (File.Exists(a)) paths.Add(a);
+                    else if (Directory.Exists(a)) CollectAudio(a, paths, 0);
+                }
+                catch { /* 单个路径无效不影响其余 */ }
+            }
+
+            if (paths.Count == 0) return;
+
+            AddPaths(paths);
+            AppendLog($"[命令行] 从启动参数收到 {paths.Count} 个文件");
+        }
+
+        private void AddPaths(IEnumerable<string> paths)
+        {            var existing = new HashSet<string>(_jobs.Items.Select(j => j.SourcePath), StringComparer.OrdinalIgnoreCase);
             int added = 0;
 
             foreach (var p in paths)
@@ -413,6 +787,8 @@ namespace ALACConverter
 
             _settings.OverwriteExisting = OverwriteCheck.IsChecked == true;
             _settings.VerifyOutput = VerifyCheck.IsChecked == true;
+            _settings.MaxParallelism = ReadParallelism();
+            ThemeService.Put("parallel", _settings.MaxParallelism.ToString());
 
             var enginePath = await FfmpegLocator.EnsureAsync(null);
             var engine = new TranscodeEngine(enginePath);
@@ -424,7 +800,10 @@ namespace ALACConverter
             var progress = new Progress<int>(n =>
             {
                 BatchProgress.Value = _jobs.Count == 0 ? 0 : n * 100.0 / _jobs.Count;
-                BatchStatusText.Text = $"正在处理 {n} / {_jobs.Count}";
+                BatchStatusText.Text = _settings.MaxParallelism > 1
+                    ? $"正在处理 {n} / {_jobs.Count}（并行 {_settings.MaxParallelism}）"
+                    : $"正在处理 {n} / {_jobs.Count}";
+                SetTaskbarProgress(n, _jobs.Count);
             });
 
             try
@@ -440,6 +819,7 @@ namespace ALACConverter
             finally
             {
                 SetRunningUi(false);
+                ClearTaskbarProgress();
                 _batchCts?.Dispose();
                 _batchCts = null;
             }
@@ -520,6 +900,9 @@ namespace ALACConverter
             }
 
             BatchStatusText.Text = $"已完成 {s.Total} 个任务，耗时 {s.ElapsedSeconds:0.0} 秒";
+
+            // 窗口可能已被最小化或切到后台，补一条系统通知
+            NotifyDone(s);
         }
 
         private const string GLYPH_SUN = "\uE706";
@@ -660,5 +1043,45 @@ namespace ALACConverter
         public void Add(AudioJob j) => Items.Add(j);
         public void Remove(AudioJob j) => Items.Remove(j);
         public void Clear() => Items.Clear();
+    }
+
+    /// <summary>任务栏进度状态（shellapi.h 的 TBPFLAG）。</summary>
+    internal enum TaskbarProgressState
+    {
+        NoProgress = 0x0,
+        Indeterminate = 0x1,
+        Normal = 0x2,
+        Error = 0x4,
+        Paused = 0x8,
+    }
+
+    /// <summary>
+    /// ITaskbarList3 的最小投影：只声明到 SetProgressState 为止。
+    ///
+    /// COM 接口按 vtable 顺序调用，所以方法必须从 ITaskbarList → ITaskbarList2 →
+    /// ITaskbarList3 依次列出，**不能只写用到的那两个**，否则调用到的就是别的方法。
+    /// 后面的缩略图按钮等方法用不到，可以省略。
+    /// </summary>
+    [System.Runtime.InteropServices.ComImport]
+    [System.Runtime.InteropServices.Guid("ea1afb91-9e28-4b86-90e9-9e9f8a5eefaf")]
+    [System.Runtime.InteropServices.InterfaceType(
+        System.Runtime.InteropServices.ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface ITaskbarList3
+    {
+        // ---- ITaskbarList ----
+        void HrInit();
+        void AddTab(IntPtr hwnd);
+        void DeleteTab(IntPtr hwnd);
+        void ActivateTab(IntPtr hwnd);
+        void SetActiveAlt(IntPtr hwnd);
+
+        // ---- ITaskbarList2 ----
+        void MarkFullscreenWindow(IntPtr hwnd,
+            [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+            bool fFullscreen);
+
+        // ---- ITaskbarList3 ----
+        void SetProgressValue(IntPtr hwnd, ulong ullCompleted, ulong ullTotal);
+        void SetProgressState(IntPtr hwnd, TaskbarProgressState tbpFlags);
     }
 }
